@@ -458,6 +458,25 @@ def convert(source_dir, dest_dir, verbosity=0, dry_run=False):
             sys.exit(1)
 
 
+def cover_art_fetch_only(source_dir, verbosity=0, dry_run=False):
+    """Fetch missing cover art into source album directories only.
+
+    Does not convert any audio or embed images in MP3 files.
+    """
+    if dry_run:
+        print("[DRY RUN] No cover art will be fetched.")
+
+    for artist_dir in sorted(Path(source_dir).iterdir()):
+        if not artist_dir.is_dir():
+            continue
+        for album_dir in sorted(artist_dir.iterdir()):
+            if not album_dir.is_dir():
+                continue
+            artist = artist_dir.name
+            album  = album_dir.name
+            ensure_cover(album_dir, artist, album, verbosity=verbosity, dry_run=dry_run)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="convert",
@@ -474,11 +493,16 @@ def main():
     parser.add_argument("-n", action="store_true", dest="dry_run", help="Dry run — show what would be done without taking action")
     parser.add_argument("--name_cleanup", action="store_true", help="Remove '(Explicit)' from album directory and song file names in both source and destination")
     parser.add_argument("--cover_art_update", action="store_true", help="Re-embed cover art into existing destination MP3s without re-encoding audio")
+    parser.add_argument("--cover_art_fetch_only", action="store_true", help="Fetch missing cover art into source directories only — no conversion or MP3 embedding")
 
     args = parser.parse_args()
 
     if not os.path.isdir(args.s):
         parser.error(f"Source directory does not exist: {args.s}")
+
+    if args.cover_art_fetch_only:
+        cover_art_fetch_only(args.s, verbosity=args.verbosity, dry_run=args.dry_run)
+        return
 
     if args.dry_run:
         print("[DRY RUN] No files will be converted.")
