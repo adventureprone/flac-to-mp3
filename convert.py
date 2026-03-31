@@ -4,7 +4,6 @@
 import argparse
 import os
 import re
-import shutil
 import sys
 import warnings
 from pathlib import Path
@@ -12,13 +11,18 @@ from pathlib import Path
 # Suppress urllib3's LibreSSL warning on older macOS versions
 warnings.filterwarnings("ignore", message=".*LibreSSL.*")
 
+import subprocess
+
 import requests
-from pydub import AudioSegment
-from pydub.exceptions import CouldntDecodeError
 
 
-def log(message, verbose, force=False):
-    if verbose or force:
+def log(message, verbosity, level=1):
+    """Print message if verbosity >= level.
+
+    level=1  shown with -v  (verbose — progress messages, no skips)
+    level=2  shown with -vv (very verbose — everything including skips)
+    """
+    if verbosity >= level:
         print(message)
 
 
@@ -32,7 +36,7 @@ def strip_explicit(name):
     return re.sub(r'\s*\(E[^).]*\)?\s*', '', name, flags=re.IGNORECASE).strip()
 
 
-def rename_explicit(path, verbose=False, dry_run=False):
+def rename_explicit(path, verbosity=0, dry_run=False):
     """Rename a file or directory by stripping '(Explicit)' from its name.
 
     Returns the (possibly renamed) Path.
@@ -45,7 +49,7 @@ def rename_explicit(path, verbose=False, dry_run=False):
     if dry_run:
         print(f"[RENAME]  {path.name!r} -> {cleaned_name!r}")
         return new_path  # return what it *would* be renamed to
-    log(f"[RENAME]  {path.name!r} -> {cleaned_name!r}", verbose)
+    log(f"[RENAME]  {path.name!r} -> {cleaned_name!r}", verbosity)
     try:
         os.rename(path, new_path)
     except OSError as e:
@@ -70,9 +74,41 @@ def build_dest_path(dest_dir, artist, album, flac_path):
     return Path(dest_dir) / artist / album / (flac_path.stem + ".mp3")
 
 
-def clean_explicit_names(source_dir, dest_dir, verbose=False, dry_run=False):
+def strip_artist_prefix(filename, artist):
+    """Remove a leading artist name and separator from a song filename.
+
+    Matches patterns like:
+      'Artist Name - 01 Song Title.flac'
+      'Artist Name – 01 Song Title.mp3'
+    The match is case-insensitive and allows optional whitespace around the separator.
+    """
+    # Separators commonly used between artist name and track title
+    pattern = rf'^{re.escape(artist)}\s*[-–]\s*'
+    return re.sub(pattern, '', filename, count=1, flags=re.IGNORECASE)
+
+
+def rename_artist_prefix(path, artist, verbosity=0, dry_run=False):
+    """Rename a song file by stripping a leading artist name prefix if present."""
+    cleaned_name = strip_artist_prefix(path.name, artist)
+    if cleaned_name == path.name:
+        return path
+
+    new_path = path.parent / cleaned_name
+    if dry_run:
+        print(f"[RENAME]  {path.name!r} -> {cleaned_name!r}")
+        return new_path
+    log(f"[RENAME]  {path.name!r} -> {cleaned_name!r}", verbosity)
+    try:
+        os.rename(path, new_path)
+    except OSError as e:
+        print(f"[ERROR]   Could not rename {path.name!r}: {e}", file=sys.stderr)
+    return new_path
+
+
+def clean_explicit_names(source_dir, dest_dir, verbosity=0, dry_run=False):
     """Rename any album directories or song files containing '(Explicit)'
-    in both the source and destination directory trees."""
+    in both the source and destination directory trees.
+    Also strips leading artist name prefixes from song filenames."""
     if dry_run:
         print("[DRY RUN] No files will be renamed.")
 
@@ -82,30 +118,128 @@ def clean_explicit_names(source_dir, dest_dir, verbose=False, dry_run=False):
         for artist_dir in sorted(root_dir.iterdir()):
             if not artist_dir.is_dir():
                 continue
+            artist = artist_dir.name
             for album_dir in sorted(artist_dir.iterdir()):
                 if not album_dir.is_dir():
                     continue
                 # Rename songs first (before potentially renaming their parent album dir)
                 for song in sorted(album_dir.iterdir()):
                     if song.suffix.lower() in ('.flac', '.mp3'):
-                        rename_explicit(song, verbose=verbose, dry_run=dry_run)
+                        song = rename_artist_prefix(song, artist, verbosity=verbosity, dry_run=dry_run)
+                        rename_explicit(song, verbosity=verbosity, dry_run=dry_run)
                 # Rename album directory
-                rename_explicit(album_dir, verbose=verbose, dry_run=dry_run)
+                rename_explicit(album_dir, verbosity=verbosity, dry_run=dry_run)
             # Rename artist directory last (after all children are handled)
-            rename_explicit(artist_dir, verbose=verbose, dry_run=dry_run)
+            rename_explicit(artist_dir, verbosity=verbosity, dry_run=dry_run)
 
 
-def fetch_wikipedia_cover(artist, album, dest_path, verbose=False):
-    """Search Wikipedia for the album page and download its main image as Folder.jpg."""
+def fetch_wikipedia_cover(artist, album, album_dir, verbosity=0):
+    """Search Wikipedia for the album page and download its cover art into album_dir.
+
+    Saves as Folder.jpg or Folder.png depending on the image format found.
+    Returns the saved Path on success, or None on failure.
+    """
     api_url = "https://en.wikipedia.org/w/api.php"
     # Wikipedia requires a descriptive User-Agent or it returns 403
     headers = {"User-Agent": "flac-to-mp3-converter/1.0 (music library tool)"}
 
+    # Supported raster formats for embedding in MP3
+    SUPPORTED_EXTS = (".jpg", ".jpeg", ".png")
     # Filenames containing these strings are never album art
-    SKIP_KEYWORDS = ("logo", "icon", "flag", "map", "commons", "edit-clear")
+    SKIP_KEYWORDS  = ("logo", "icon", "flag", "map", "commons", "edit-clear")
+
+    def find_image_on_page(page_title):
+        """Try to find a usable cover image URL for a given Wikipedia page title.
+        Returns an image URL string or None.
+
+        Strategy:
+          1. Parse the page wikitext to extract the cover filename directly from
+             the {{Infobox album}} template — the most reliable source.
+          2. Fall back to the images list sorted by filename similarity to the
+             album title (substring match beats word overlap beats character count).
+          3. Last resort: pageimages (free images only, no SVGs).
+        """
+        def imageinfo_url(file_title):
+            """Return the direct URL for a File: title, or None."""
+            if not file_title.lower().startswith("file:"):
+                file_title = f"File:{file_title}"
+            r = requests.get(api_url, headers=headers, params={
+                "action": "query", "titles": file_title,
+                "prop": "imageinfo", "iiprop": "url", "format": "json",
+            }, timeout=10)
+            r.raise_for_status()
+            info = next(iter(r.json()["query"]["pages"].values())).get("imageinfo", [])
+            return info[0]["url"] if info else None
+
+        img_url = None
+
+        # --- Step 1: extract cover from infobox wikitext ---
+        rev_resp = requests.get(api_url, headers=headers, params={
+            "action": "query", "titles": page_title,
+            "prop": "revisions", "rvprop": "content",
+            "rvslots": "main", "format": "json", "formatversion": "2",
+        }, timeout=15)
+        rev_resp.raise_for_status()
+        rev_pages = rev_resp.json().get("query", {}).get("pages", [])
+        if rev_pages:
+            content = (rev_pages[0].get("revisions") or [{}])[0] \
+                          .get("slots", {}).get("main", {}).get("content", "")
+            m = re.search(r'\|\s*(?:cover|image)\s*=\s*([^\|\}\n\[\]]+)', content, re.IGNORECASE)
+            if m:
+                cover_file = m.group(1).strip()
+                if cover_file and not cover_file.lower().endswith(".svg"):
+                    log(f"[WIKI]    Infobox cover: '{cover_file}'", verbosity)
+                    img_url = imageinfo_url(cover_file)
+                elif cover_file:
+                    log(f"[WIKI]    Infobox cover is SVG, falling back to image list", verbosity)
+
+        # --- Step 2: images list sorted by filename similarity ---
+        if not img_url:
+            img_resp = requests.get(api_url, headers=headers, params={
+                "action": "query", "titles": page_title,
+                "prop": "images", "imlimit": 20, "format": "json",
+            }, timeout=10)
+            img_resp.raise_for_status()
+            page_data = next(iter(img_resp.json()["query"]["pages"].values()))
+
+            def cover_score(file_title):
+                stem = re.sub(r'[^a-z0-9]', '', Path(file_title).stem.lower())
+                norm_album  = re.sub(r'[^a-z0-9]', '', album.lower())
+                norm_artist = re.sub(r'[^a-z0-9]', '', artist.lower())
+                if norm_album and norm_album in stem:
+                    return 100
+                if norm_artist and norm_artist in stem:
+                    return 50
+                kw = set(re.sub(r'[^a-z0-9]', ' ', f"{album} {artist}").lower().split())
+                return len(set(re.sub(r'[^a-z0-9]', ' ', stem).split()) & kw)
+
+            candidates = sorted([
+                img["title"] for img in page_data.get("images", [])
+                if any(img["title"].lower().endswith(ext) for ext in SUPPORTED_EXTS)
+                and not any(kw in img["title"].lower() for kw in SKIP_KEYWORDS)
+            ], key=cover_score, reverse=True)
+
+            for title in candidates:
+                img_url = imageinfo_url(title)
+                if img_url:
+                    break
+
+        # --- Step 3: pageimages fallback (free images, no SVGs) ---
+        if not img_url:
+            pi_resp = requests.get(api_url, headers=headers, params={
+                "action": "query", "titles": page_title,
+                "prop": "pageimages", "piprop": "original", "format": "json",
+            }, timeout=10)
+            pi_resp.raise_for_status()
+            pi_page = next(iter(pi_resp.json()["query"]["pages"].values()))
+            pi_url  = pi_page.get("original", {}).get("source")
+            if pi_url and Path(pi_url.split("?")[0]).suffix.lower() != ".svg":
+                img_url = pi_url
+
+        return img_url
 
     try:
-        # Step 1: search for the album article
+        # Step 1: search for the album article — fetch top 3 candidates
         search_resp = requests.get(
             api_url,
             headers=headers,
@@ -114,7 +248,7 @@ def fetch_wikipedia_cover(artist, album, dest_path, verbose=False):
                 "list": "search",
                 "srsearch": f"{artist} {album} album",
                 "format": "json",
-                "srlimit": 1,
+                "srlimit": 3,
             },
             timeout=10,
         )
@@ -122,85 +256,74 @@ def fetch_wikipedia_cover(artist, album, dest_path, verbose=False):
         results = search_resp.json().get("query", {}).get("search", [])
         if not results:
             print(f"[WARN]    No Wikipedia page found for '{artist} — {album}'", file=sys.stderr)
-            return
-        page_title = results[0]["title"]
-        log(f"[WIKI]    Found page: '{page_title}'", verbose)
+            return None
 
-        # Step 2a: try pageimages (fast path — works for freely-licensed images)
-        img_resp = requests.get(
-            api_url,
-            headers=headers,
-            params={
-                "action": "query",
-                "titles": page_title,
-                "prop": "pageimages|images",
-                "piprop": "original",
-                "imlimit": 10,
-                "format": "json",
-            },
-            timeout=10,
-        )
-        img_resp.raise_for_status()
-        pages = img_resp.json().get("query", {}).get("pages", {})
-        page = next(iter(pages.values()))
-        img_url = page.get("original", {}).get("source")
-
-        # Step 2b: fall back to images list + imageinfo for non-free (copyrighted) covers
-        if not img_url:
-            images = page.get("images", [])
-            for img in images:
-                title = img["title"]
-                lower = title.lower()
-                # Only consider jpg/jpeg/png; skip known non-art files
-                if not any(lower.endswith(ext) for ext in (".jpg", ".jpeg", ".png")):
-                    continue
-                if any(kw in lower for kw in SKIP_KEYWORDS):
-                    continue
-                # Get the direct URL via imageinfo
-                info_resp = requests.get(
-                    api_url,
-                    headers=headers,
-                    params={
-                        "action": "query",
-                        "titles": title,
-                        "prop": "imageinfo",
-                        "iiprop": "url",
-                        "format": "json",
-                    },
-                    timeout=10,
-                )
-                info_resp.raise_for_status()
-                info_pages = info_resp.json().get("query", {}).get("pages", {})
-                info_page = next(iter(info_pages.values()))
-                imageinfo = info_page.get("imageinfo", [])
-                if imageinfo:
-                    img_url = imageinfo[0].get("url")
-                    if img_url:
-                        break
+        # Step 2: try each candidate until one yields a usable image
+        img_url = None
+        for result in results:
+            page_title = result["title"]
+            log(f"[WIKI]    Trying page: '{page_title}'", verbosity)
+            img_url = find_image_on_page(page_title)
+            if img_url:
+                log(f"[WIKI]    Found image on page: '{page_title}'", verbosity)
+                break
 
         if not img_url:
             print(f"[WARN]    No image found on Wikipedia for '{artist} — {album}'", file=sys.stderr)
-            return
-        log(f"[WIKI]    Downloading image: {img_url}", verbose)
+            return None
 
-        # Step 3: download and save
+        # Derive Folder filename from the URL's extension
+        url_ext = Path(img_url.split("?")[0]).suffix.lower()
+        folder_name = "Folder.png" if url_ext == ".png" else "Folder.jpg"
+        dest_path = album_dir / folder_name
+
+        log(f"[WIKI]    Downloading image: {img_url}", verbosity)
+
+        # Step 3: download with one retry on 429 (rate limit)
+        import time
         dl_resp = requests.get(img_url, headers=headers, timeout=30)
+        if dl_resp.status_code == 429:
+            retry_after = int(dl_resp.headers.get("Retry-After", 5))
+            log(f"[WIKI]    Rate limited — waiting {retry_after}s before retry", verbosity)
+            time.sleep(retry_after)
+            dl_resp = requests.get(img_url, headers=headers, timeout=30)
         dl_resp.raise_for_status()
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        album_dir.mkdir(parents=True, exist_ok=True)
         dest_path.write_bytes(dl_resp.content)
-        log(f"[DONE]    Cover art saved: {dest_path}", verbose)
+        log(f"[DONE]    Cover art saved: {dest_path}", verbosity)
+        return dest_path
 
     except requests.RequestException as e:
         print(f"[ERROR]   Could not fetch cover art for '{artist} — {album}': {e}", file=sys.stderr)
+        return None
 
 
-def handle_cover_art(source_dir, dest_dir, verbose=False, dry_run=False):
-    """Ensure each album in the destination has a Folder.jpg.
-    Copies from source if present, otherwise fetches from Wikipedia."""
-    source = Path(source_dir)
-    dest = Path(dest_dir)
+def ensure_cover(album_dir, artist, album, verbosity=0, dry_run=False):
+    """Return the path to cover art (Folder.jpg or Folder.png) in album_dir.
 
-    for artist_dir in sorted(source.iterdir()):
+    Fetches from Wikipedia if neither file exists.
+    In dry-run mode no fetch is performed — returns None if the file is absent.
+    """
+    for name in ("Folder.jpg", "Folder.png"):
+        cover = album_dir / name
+        if cover.exists():
+            return cover
+    if dry_run:
+        print(f"[MISSING] No cover art for '{artist} — {album}' (would fetch from Wikipedia)")
+        return None
+    log(f"[FETCH]   No cover art for '{artist} — {album}', fetching from Wikipedia...", verbosity)
+    return fetch_wikipedia_cover(artist, album, album_dir, verbosity=verbosity)
+
+
+def cover_art_update(source_dir, dest_dir, verbosity=0, dry_run=False):
+    """Re-embed cover art into existing destination MP3s without re-encoding audio.
+
+    Uses ffmpeg's -codec:a copy so only the ID3 picture frame is rewritten.
+    """
+    if dry_run:
+        print("[DRY RUN] No files will be modified.")
+
+    for artist_dir in sorted(Path(source_dir).iterdir()):
         if not artist_dir.is_dir():
             continue
         for album_dir in sorted(artist_dir.iterdir()):
@@ -208,33 +331,48 @@ def handle_cover_art(source_dir, dest_dir, verbose=False, dry_run=False):
                 continue
 
             artist = artist_dir.name
-            album = album_dir.name
-            src_cover = album_dir / "Folder.jpg"
-            dest_cover = dest / artist / album / "Folder.jpg"
+            album  = album_dir.name
+            cover  = ensure_cover(album_dir, artist, album, verbosity=verbosity, dry_run=dry_run)
 
-            if dest_cover.exists():
-                log(f"[SKIP]    Cover art already exists: {artist} — {album}", verbose)
+            if not cover:
                 continue
 
-            if src_cover.exists():
+            dest_album = Path(dest_dir) / artist / album
+            if not dest_album.exists():
+                continue
+
+            for mp3 in sorted(dest_album.glob("*.mp3")):
                 if dry_run:
-                    print(f"[COPY]    Cover art: {src_cover} -> {dest_cover}")
-                else:
-                    log(f"[COPY]    Cover art: {artist} — {album}", verbose)
-                    dest_cover.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src_cover, dest_cover)
-            else:
-                if dry_run:
-                    print(f"[MISSING] Cover art not found for '{artist} — {album}' (would fetch from Wikipedia into both source and destination)")
-                else:
-                    log(f"[FETCH]   Cover art missing for '{artist} — {album}', fetching from Wikipedia...", verbose)
-                    fetch_wikipedia_cover(artist, album, dest_cover, verbose=verbose)
-                    # Also copy into the source (flac) directory if the download succeeded
-                    if dest_cover.exists():
-                        shutil.copy2(dest_cover, src_cover)
+                    print(f"[UPDATE]  Cover art: {mp3.name}")
+                    continue
+                log(f"[UPDATE]  Cover art: {mp3.name}", verbosity)
+                tmp = mp3.with_suffix(".tmp.mp3")
+                try:
+                    subprocess.run(
+                        [
+                            "ffmpeg",
+                            "-i", str(mp3),
+                            "-i", str(cover),
+                            "-map", "0:a",               # audio from existing MP3
+                            "-map", "1:v",               # image from Folder.jpg/png
+                            "-codec:a", "copy",          # copy audio — no re-encode
+                            "-map_metadata", "0",        # preserve existing tags
+                            "-metadata:s:v", "title=Album cover",
+                            "-metadata:s:v", "comment=Cover (front)",
+                            "-id3v2_version", "3",
+                            "-y", str(tmp),
+                        ],
+                        check=True,
+                        capture_output=True,
+                    )
+                    tmp.replace(mp3)
+                except subprocess.CalledProcessError as e:
+                    print(f"[ERROR]   Failed to update cover art for {mp3.name}:\n{e.stderr.decode()}", file=sys.stderr)
+                    if tmp.exists():
+                        tmp.unlink()
 
 
-def convert(source_dir, dest_dir, verbose=False, dry_run=False):
+def convert(source_dir, dest_dir, verbosity=0, dry_run=False):
     flac_files = list(find_flac_files(source_dir))
 
     if not flac_files:
@@ -245,23 +383,43 @@ def convert(source_dir, dest_dir, verbose=False, dry_run=False):
         dest_path = build_dest_path(dest_dir, artist, album, flac_path)
 
         if dest_path.exists():
-            log(f"[SKIP]    {flac_path.name} — destination already exists", verbose)
+            log(f"[SKIP]    {flac_path.name} — destination already exists", verbosity, level=2)
             continue
+
+        cover = ensure_cover(flac_path.parent, artist, album, verbosity=verbosity, dry_run=dry_run)
 
         if dry_run:
             print(f"[CONVERT] {flac_path} -> {dest_path}")
             continue
 
-        log(f"[CONVERT] {flac_path.name} -> {dest_path}", verbose)
+        log(f"[CONVERT] {flac_path.name} -> {dest_path}", verbosity)
 
         dest_path.parent.mkdir(parents=True, exist_ok=True)
 
+        has_cover = cover is not None and cover.exists()
+
         try:
-            audio = AudioSegment.from_file(flac_path, format="flac")
-            audio.export(dest_path, format="mp3")
-            log(f"[DONE]    {dest_path.name}", verbose)
-        except CouldntDecodeError as e:
-            print(f"[ERROR]   Could not decode {flac_path}: {e}", file=sys.stderr)
+            cmd = ["ffmpeg", "-i", str(flac_path)]
+            if has_cover:
+                cmd += ["-i", str(cover)]        # second input: cover art
+            cmd += ["-map_metadata", "0"]        # copy all metadata from FLAC
+            cmd += ["-map", "0:a"]               # map audio stream
+            if has_cover:
+                cmd += [
+                    "-map", "1:v",               # map cover image stream
+                    "-metadata:s:v", "title=Album cover",
+                    "-metadata:s:v", "comment=Cover (front)",
+                ]
+            cmd += [
+                "-id3v2_version", "3",           # ID3v2.3 for widest compatibility
+                "-q:a", "2",                     # VBR quality ~190 kbps
+                "-y",                            # overwrite without prompting
+                str(dest_path),
+            ]
+            subprocess.run(cmd, check=True, capture_output=True)
+            log(f"[DONE]    {dest_path.name}{' (with cover art)' if has_cover else ''}", verbosity)
+        except subprocess.CalledProcessError as e:
+            print(f"[ERROR]   ffmpeg failed for {flac_path.name}:\n{e.stderr.decode()}", file=sys.stderr)
         except FileNotFoundError:
             print(
                 "[ERROR]   ffmpeg not found. Install it to use this tool:\n"
@@ -279,10 +437,15 @@ def main():
     )
     parser.add_argument("-s", required=True, metavar="SOURCE", help="Source directory (artist/album/song structure)")
     parser.add_argument("-d", required=True, metavar="DEST", help="Destination directory")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output — explain each step")
+    parser.add_argument("-v", dest="verbosity", action="count", default=0,
+                        help="Verbose output (-v: progress messages; -vv: also show skipped files)")
+    parser.add_argument("--verbose", dest="verbosity", action="store_const", const=1,
+                        help="Verbose output — progress messages, no skip messages")
+    parser.add_argument("--very_verbose", dest="verbosity", action="store_const", const=2,
+                        help="Very verbose — all messages including skipped files")
     parser.add_argument("-n", action="store_true", dest="dry_run", help="Dry run — show what would be done without taking action")
     parser.add_argument("--name_cleanup", action="store_true", help="Remove '(Explicit)' from album directory and song file names in both source and destination")
-    parser.add_argument("--cover_art", action="store_true", help="Ensure each album has a Folder.jpg — copies from source if present, otherwise fetches from Wikipedia")
+    parser.add_argument("--cover_art_update", action="store_true", help="Re-embed cover art into existing destination MP3s without re-encoding audio")
 
     args = parser.parse_args()
 
@@ -292,11 +455,11 @@ def main():
     if args.dry_run:
         print("[DRY RUN] No files will be converted.")
 
-    convert(args.s, args.d, verbose=args.verbose, dry_run=args.dry_run)
+    convert(args.s, args.d, verbosity=args.verbosity, dry_run=args.dry_run)
     if args.name_cleanup:
-        clean_explicit_names(args.s, args.d, verbose=args.verbose, dry_run=args.dry_run)
-    if args.cover_art:
-        handle_cover_art(args.s, args.d, verbose=args.verbose, dry_run=args.dry_run)
+        clean_explicit_names(args.s, args.d, verbosity=args.verbosity, dry_run=args.dry_run)
+    if args.cover_art_update:
+        cover_art_update(args.s, args.d, verbosity=args.verbosity, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
