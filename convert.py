@@ -14,6 +14,7 @@ warnings.filterwarnings("ignore", message=".*LibreSSL.*")
 import subprocess
 
 import requests
+from PIL import Image
 
 
 def log(message, verbosity, level=1):
@@ -289,7 +290,19 @@ def fetch_wikipedia_cover(artist, album, album_dir, verbosity=0):
             dl_resp = requests.get(img_url, headers=headers, timeout=30)
         dl_resp.raise_for_status()
         album_dir.mkdir(parents=True, exist_ok=True)
-        dest_path.write_bytes(dl_resp.content)
+
+        # Scale down to 600x600 max if needed, preserving aspect ratio
+        MAX_SIZE = 600
+        import io
+        img = Image.open(io.BytesIO(dl_resp.content))
+        if img.width > MAX_SIZE or img.height > MAX_SIZE:
+            original_size = f"{img.width}x{img.height}"
+            img.thumbnail((MAX_SIZE, MAX_SIZE), Image.LANCZOS)
+            log(f"[WIKI]    Scaled cover art from {original_size} to {img.width}x{img.height}", verbosity)
+            img.save(dest_path)
+        else:
+            dest_path.write_bytes(dl_resp.content)
+
         log(f"[DONE]    Cover art saved: {dest_path}", verbosity)
         return dest_path
 
