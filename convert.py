@@ -160,17 +160,27 @@ def fetch_wikipedia_cover(artist, album, album_dir, verbosity=0):
              album title (substring match beats word overlap beats character count).
           3. Last resort: pageimages (free images only, no SVGs).
         """
-        def imageinfo_url(file_title):
-            """Return the direct URL for a File: title, or None."""
+        def imageinfo_url(file_title, render_width=None):
+            """Return the direct URL for a File: title, or None.
+
+            Pass render_width to request a server-side render (useful for SVGs —
+            Wikimedia will return a PNG thumbnail URL instead of the raw SVG).
+            """
             if not file_title.lower().startswith("file:"):
                 file_title = f"File:{file_title}"
-            r = requests.get(api_url, headers=headers, params={
+            params = {
                 "action": "query", "titles": file_title,
                 "prop": "imageinfo", "iiprop": "url", "format": "json",
-            }, timeout=10)
+            }
+            if render_width:
+                params["iiurlwidth"] = render_width
+            r = requests.get(api_url, headers=headers, params=params, timeout=10)
             r.raise_for_status()
             info = next(iter(r.json()["query"]["pages"].values())).get("imageinfo", [])
-            return info[0]["url"] if info else None
+            if not info:
+                return None
+            # iiurlwidth populates thumburl; fall back to url for normal images
+            return info[0].get("thumburl") or info[0].get("url")
 
         img_url = None
 
@@ -188,11 +198,14 @@ def fetch_wikipedia_cover(artist, album, album_dir, verbosity=0):
             m = re.search(r'\|\s*(?:cover|image)\s*=\s*([^\|\}\n\[\]]+)', content, re.IGNORECASE)
             if m:
                 cover_file = m.group(1).strip()
-                if cover_file and not cover_file.lower().endswith(".svg"):
+                if cover_file:
                     log(f"[WIKI]    Infobox cover: '{cover_file}'", verbosity)
-                    img_url = imageinfo_url(cover_file)
-                elif cover_file:
-                    log(f"[WIKI]    Infobox cover is SVG, falling back to image list", verbosity)
+                    if cover_file.lower().endswith(".svg"):
+                        # Request a server-side PNG render of the SVG at 600px wide
+                        log(f"[WIKI]    SVG cover — requesting PNG render", verbosity)
+                        img_url = imageinfo_url(cover_file, render_width=600)
+                    else:
+                        img_url = imageinfo_url(cover_file)
 
         # --- Step 2: images list sorted by filename similarity ---
         if not img_url:
@@ -280,14 +293,16 @@ def fetch_wikipedia_cover(artist, album, album_dir, verbosity=0):
 
         log(f"[WIKI]    Downloading image: {img_url}", verbosity)
 
-        # Step 3: download with one retry on 429 (rate limit)
+        # Step 3: download with retries on 429 (rate limit)
         import time
-        dl_resp = requests.get(img_url, headers=headers, timeout=30)
-        if dl_resp.status_code == 429:
-            retry_after = int(dl_resp.headers.get("Retry-After", 5))
-            log(f"[WIKI]    Rate limited — waiting {retry_after}s before retry", verbosity)
-            time.sleep(retry_after)
+        dl_resp = None
+        for attempt in range(4):
             dl_resp = requests.get(img_url, headers=headers, timeout=30)
+            if dl_resp.status_code != 429:
+                break
+            wait = int(dl_resp.headers.get("Retry-After", 5)) * (attempt + 1)
+            log(f"[WIKI]    Rate limited — waiting {wait}s before retry {attempt + 1}/3", verbosity)
+            time.sleep(wait)
         dl_resp.raise_for_status()
         album_dir.mkdir(parents=True, exist_ok=True)
 
