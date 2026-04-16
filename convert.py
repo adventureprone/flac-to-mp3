@@ -2,6 +2,7 @@
 """Convert FLAC files to MP3, mirroring the source directory structure."""
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -344,70 +345,108 @@ def artwork_update_only(source_dir, dest_dir, verbosity=0, dry_run=False):
                     tmp.unlink()
 
 
-def metadata_update_only(source_dir, dest_dir, verbosity=0, dry_run=False):
-    """Update tags and cover art in existing destination MP3s from source FLACs.
+_COMPARE_TAGS = ("title", "album", "artist", "albumartist", "tracknumber", "date", "genre")
 
-    Audio is not re-encoded.  Only destination files that already exist are
-    processed — there is no conversion of new files.  The source directory is
-    never modified.
+_TAG_LABELS = {
+    "title":       "Title",
+    "album":       "Album",
+    "artist":      "Artist",
+    "albumartist": "Album Artist",
+    "tracknumber": "Track Number",
+    "date":        "Date",
+    "genre":       "Genre",
+}
+
+
+def _read_tags(path):
+    """Return a lowercase tag dict for any media file via ffprobe."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_format", str(path)],
+            capture_output=True, text=True, check=True,
+        )
+        raw = json.loads(result.stdout).get("format", {}).get("tags", {})
+        return {k.lower(): v for k, v in raw.items()}
+    except Exception:
+        return {}
+
+
+def _print_tag_diff(old_tags, new_tags):
+    """Print one line per tag that differs between old_tags and new_tags."""
+    for tag in _COMPARE_TAGS:
+        old = old_tags.get(tag, "")
+        new = new_tags.get(tag, "")
+        if old != new:
+            print(f"  {tag + ':':<13} {old!r}  →  {new!r}")
+
+
+def metadata_update_only(source_dir, dest_dir, verbosity=0, dry_run=False):
+    """Update tags in existing destination MP3s from source FLACs.
+
+    Audio and cover art are not touched — use --artwork_update_only for cover art.
+    Only destination files that already exist are processed.
+    The source directory is never modified.
     """
     if dry_run:
         print("[DRY RUN] No files will be modified.")
 
-    for artist, album, flac_path in find_flac_files(source_dir):
-        dest_path = build_dest_path(dest_dir, artist, album, flac_path)
+    for artist, album, album_dir in find_albums(source_dir):
+        album_header_printed = False
 
-        if not dest_path.exists():
-            log(f"[SKIP]    {flac_path.name} — no destination file", verbosity, level=2)
-            continue
+        for flac_path in sorted(album_dir.glob("*.flac")):
+            dest_path = build_dest_path(dest_dir, artist, album, flac_path)
 
-        # Use existing cover art from the source album dir — do not fetch
-        cover = next(
-            (flac_path.parent / name
-             for name in ("Folder.jpg", "folder.jpg", "Folder.png", "folder.png")
-             if (flac_path.parent / name).exists()),
-            None,
-        )
+            if not dest_path.exists():
+                log(f"[SKIP]    {flac_path.name} — no destination file", verbosity, level=2)
+                continue
 
-        if dry_run:
-            suffix = " (with cover art)" if cover else ""
-            print(f"[UPDATE]  Metadata: {dest_path.name}{suffix}")
-            continue
+            # Read current tags from dest MP3 and incoming tags from source FLAC
+            dest_tags = _read_tags(dest_path)
+            flac_tags = _read_tags(flac_path)
 
-        log(f"[UPDATE]  Metadata: {dest_path.name}", verbosity)
+            # Skip entirely if nothing would change
+            changed = [t for t in _COMPARE_TAGS if dest_tags.get(t) != flac_tags.get(t)]
+            if not changed:
+                log(f"[SKIP]    No metadata changes: {dest_path.name}", verbosity, level=2)
+                continue
 
-        tmp = dest_path.with_suffix(".tmp.mp3")
-        try:
-            cmd = [
-                "ffmpeg",
-                "-i", str(dest_path),    # input 0 — existing MP3 (audio)
-                "-i", str(flac_path),    # input 1 — source FLAC (metadata)
-            ]
-            if cover:
-                cmd += ["-i", str(cover)]  # input 2 — cover image
+            # Print the album header once, only when the first change is found
+            if not album_header_printed:
+                print(f"\n{artist} — {album}")
+                album_header_printed = True
 
-            cmd += [
-                "-map", "0:a",             # audio stream from existing MP3
-                "-map_metadata", "1",      # all tags from source FLAC
-            ]
-            if cover:
-                cmd += [
-                    "-map", "2:v",
-                    "-metadata:s:v", "title=Album cover",
-                    "-metadata:s:v", "comment=Cover (front)",
-                ]
-            cmd += [
-                "-codec:a", "copy",        # copy audio — no re-encode
-                "-id3v2_version", "3",
-                "-y", str(tmp),
-            ]
-            subprocess.run(cmd, check=True, capture_output=True)
-            tmp.replace(dest_path)
-            log(f"[DONE]    {dest_path.name}{' (with cover art)' if cover else ''}", verbosity)
-        except subprocess.CalledProcessError as e:
-            print(f"[ERROR]   Failed to update metadata for {dest_path.name}:\n{e.stderr.decode()}", file=sys.stderr)
-            if tmp.exists():
-                tmp.unlink()
+            label = ", ".join(_TAG_LABELS.get(t, t.title()) for t in changed)
+
+            if dry_run:
+                print(f"[UPDATE]  {label}: {dest_path.name}")
+                _print_tag_diff(dest_tags, flac_tags)
+                continue
+
+            print(f"[UPDATE]  {label}: {dest_path.name}")
+            _print_tag_diff(dest_tags, flac_tags)
+
+            tmp = dest_path.with_suffix(".tmp.mp3")
+            try:
+                subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-i", str(dest_path),    # input 0 — existing MP3 (audio)
+                        "-i", str(flac_path),    # input 1 — source FLAC (metadata)
+                        "-map", "0:a",           # audio stream from existing MP3
+                        "-map_metadata", "1",    # all tags from source FLAC
+                        "-codec:a", "copy",      # no re-encode
+                        "-id3v2_version", "3",
+                        "-y", str(tmp),
+                    ],
+                    check=True, capture_output=True,
+                )
+                tmp.replace(dest_path)
+                log(f"[DONE]    {dest_path.name}", verbosity)
+            except subprocess.CalledProcessError as e:
+                print(f"[ERROR]   Failed to update metadata for {dest_path.name}:\n{e.stderr.decode()}", file=sys.stderr)
+                if tmp.exists():
+                    tmp.unlink()
 
 
 def convert(source_dir, dest_dir, verbosity=0, dry_run=False):
