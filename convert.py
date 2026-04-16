@@ -27,111 +27,57 @@ def log(message, verbosity, level=1):
         print(message)
 
 
-def strip_explicit(name):
-    """Remove '(Explicit)' or any partial tag starting with '(E' (case-insensitive)
-    and tidy up leftover whitespace."""
-    # Apply regex directly to the full name — avoids stem/suffix splitting bugs
-    # with directory names that contain dots (e.g. 'Mr. Morale & The Big Steppers (Explicit)').
-    # [^).] stops matching at a dot or closing paren so file extensions are preserved
-    # even when the tag is truncated (e.g. 'Song (Expli.flac' -> 'Song.flac').
-    return re.sub(r'\s*\(E[^).]*\)?\s*', '', name, flags=re.IGNORECASE).strip()
+def detect_source_level(source_dir):
+    """Detect whether source_dir is a top-level, artist-level, or album-level directory.
 
-
-def rename_explicit(path, verbosity=0, dry_run=False):
-    """Rename a file or directory by stripping '(Explicit)' from its name.
-
-    Returns the (possibly renamed) Path.
+    Returns one of:
+      'album'  — the directory directly contains .flac files
+      'artist' — subdirectories contain .flac files
+      'top'    — sub-subdirectories contain .flac files (default)
     """
-    cleaned_name = strip_explicit(path.name)
-    if cleaned_name == path.name:
-        return path  # nothing to do
+    source = Path(source_dir)
+    if any(source.glob("*.flac")):
+        return "album"
+    for subdir in source.iterdir():
+        if subdir.is_dir() and any(subdir.glob("*.flac")):
+            return "artist"
+    return "top"
 
-    new_path = path.parent / cleaned_name
-    if dry_run:
-        print(f"[RENAME]  {path.name!r} -> {cleaned_name!r}")
-        return new_path  # return what it *would* be renamed to
-    log(f"[RENAME]  {path.name!r} -> {cleaned_name!r}", verbosity)
-    try:
-        os.rename(path, new_path)
-    except OSError as e:
-        print(f"[ERROR]   Could not rename {path.name!r}: {e}", file=sys.stderr)
-    return new_path
+
+def find_albums(source_dir):
+    """Yield (artist, album, album_dir) tuples, adapting to the detected source level.
+
+    album level  → one tuple; artist = parent dir name, album = dir name
+    artist level → one tuple per album subdir
+    top level    → one tuple per artist/album pair (original behaviour)
+    """
+    source = Path(source_dir)
+    level = detect_source_level(source_dir)
+
+    if level == "album":
+        yield source.parent.name, source.name, source
+    elif level == "artist":
+        for album_dir in sorted(source.iterdir()):
+            if album_dir.is_dir():
+                yield source.name, album_dir.name, album_dir
+    else:  # top
+        for artist_dir in sorted(source.iterdir()):
+            if not artist_dir.is_dir():
+                continue
+            for album_dir in sorted(artist_dir.iterdir()):
+                if album_dir.is_dir():
+                    yield artist_dir.name, album_dir.name, album_dir
 
 
 def find_flac_files(source_dir):
     """Yield (artist, album, flac_path) tuples for all .flac files."""
-    source = Path(source_dir)
-    for artist_dir in sorted(source.iterdir()):
-        if not artist_dir.is_dir():
-            continue
-        for album_dir in sorted(artist_dir.iterdir()):
-            if not album_dir.is_dir():
-                continue
-            for flac_file in sorted(album_dir.glob("*.flac")):
-                yield artist_dir.name, album_dir.name, flac_file
+    for artist, album, album_dir in find_albums(source_dir):
+        for flac_file in sorted(album_dir.glob("*.flac")):
+            yield artist, album, flac_file
 
 
 def build_dest_path(dest_dir, artist, album, flac_path):
     return Path(dest_dir) / artist / album / (flac_path.stem + ".mp3")
-
-
-def strip_artist_prefix(filename, artist):
-    """Remove a leading artist name and separator from a song filename.
-
-    Matches patterns like:
-      'Artist Name - 01 Song Title.flac'
-      'Artist Name – 01 Song Title.mp3'
-    The match is case-insensitive and allows optional whitespace around the separator.
-    """
-    # Separators commonly used between artist name and track title
-    pattern = rf'^{re.escape(artist)}\s*[-–]\s*'
-    return re.sub(pattern, '', filename, count=1, flags=re.IGNORECASE)
-
-
-def rename_artist_prefix(path, artist, verbosity=0, dry_run=False):
-    """Rename a song file by stripping a leading artist name prefix if present."""
-    cleaned_name = strip_artist_prefix(path.name, artist)
-    if cleaned_name == path.name:
-        return path
-
-    new_path = path.parent / cleaned_name
-    if dry_run:
-        print(f"[RENAME]  {path.name!r} -> {cleaned_name!r}")
-        return new_path
-    log(f"[RENAME]  {path.name!r} -> {cleaned_name!r}", verbosity)
-    try:
-        os.rename(path, new_path)
-    except OSError as e:
-        print(f"[ERROR]   Could not rename {path.name!r}: {e}", file=sys.stderr)
-    return new_path
-
-
-def clean_explicit_names(source_dir, dest_dir, verbosity=0, dry_run=False):
-    """Rename any album directories or song files containing '(Explicit)'
-    in both the source and destination directory trees.
-    Also strips leading artist name prefixes from song filenames."""
-    if dry_run:
-        print("[DRY RUN] No files will be renamed.")
-
-    for root_dir in [Path(source_dir), Path(dest_dir)]:
-        if not root_dir.exists():
-            continue
-        for artist_dir in sorted(root_dir.iterdir()):
-            if not artist_dir.is_dir():
-                continue
-            artist = artist_dir.name
-            for album_dir in sorted(artist_dir.iterdir()):
-                if not album_dir.is_dir():
-                    continue
-                # Rename songs first (before potentially renaming their parent album dir)
-                for song in sorted(album_dir.iterdir()):
-                    if song.suffix.lower() in ('.flac', '.mp3'):
-                        song = rename_artist_prefix(song, artist, verbosity=verbosity, dry_run=dry_run)
-                        rename_explicit(song, verbosity=verbosity, dry_run=dry_run)
-                # Rename album directory
-                rename_explicit(album_dir, verbosity=verbosity, dry_run=dry_run)
-            # Rename artist directory last (after all children are handled)
-            rename_explicit(artist_dir, verbosity=verbosity, dry_run=dry_run)
 
 
 def fetch_wikipedia_cover(artist, album, album_dir, verbosity=0):
@@ -332,7 +278,7 @@ def ensure_cover(album_dir, artist, album, verbosity=0, dry_run=False):
     Fetches from Wikipedia if neither file exists.
     In dry-run mode no fetch is performed — returns None if the file is absent.
     """
-    for name in ("Folder.jpg", "Folder.png"):
+    for name in ("Folder.jpg", "folder.jpg", "Folder.png", "folder.png"):
         cover = album_dir / name
         if cover.exists():
             return cover
@@ -343,61 +289,125 @@ def ensure_cover(album_dir, artist, album, verbosity=0, dry_run=False):
     return fetch_wikipedia_cover(artist, album, album_dir, verbosity=verbosity)
 
 
-def cover_art_update(source_dir, dest_dir, verbosity=0, dry_run=False):
+def artwork_update_only(source_dir, dest_dir, verbosity=0, dry_run=False):
     """Re-embed cover art into existing destination MP3s without re-encoding audio.
 
+    Only processes MP3s that already exist in the destination — no conversion runs.
     Uses ffmpeg's -codec:a copy so only the ID3 picture frame is rewritten.
     """
     if dry_run:
         print("[DRY RUN] No files will be modified.")
 
-    for artist_dir in sorted(Path(source_dir).iterdir()):
-        if not artist_dir.is_dir():
+    for artist, album, album_dir in find_albums(source_dir):
+        # Only use artwork that already exists — do not fetch from Wikipedia
+        cover = next(
+            (album_dir / name for name in ("Folder.jpg", "folder.jpg", "Folder.png", "folder.png")
+             if (album_dir / name).exists()),
+            None,
+        )
+        if not cover:
+            log(f"[SKIP]    No cover art found for '{artist} — {album}'", verbosity, level=2)
             continue
-        for album_dir in sorted(artist_dir.iterdir()):
-            if not album_dir.is_dir():
+
+        dest_album = Path(dest_dir) / artist / album
+        if not dest_album.exists():
+            continue
+
+        for mp3 in sorted(dest_album.glob("*.mp3")):
+            if dry_run:
+                print(f"[UPDATE]  Cover art: {mp3.name}")
                 continue
+            log(f"[UPDATE]  Cover art: {mp3.name}", verbosity)
+            tmp = mp3.with_suffix(".tmp.mp3")
+            try:
+                subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-i", str(mp3),
+                        "-i", str(cover),
+                        "-map", "0:a",               # audio from existing MP3
+                        "-map", "1:v",               # image from Folder.jpg/png
+                        "-codec:a", "copy",          # copy audio — no re-encode
+                        "-map_metadata", "0",        # preserve existing tags
+                        "-metadata:s:v", "title=Album cover",
+                        "-metadata:s:v", "comment=Cover (front)",
+                        "-id3v2_version", "3",
+                        "-y", str(tmp),
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+                tmp.replace(mp3)
+            except subprocess.CalledProcessError as e:
+                print(f"[ERROR]   Failed to update cover art for {mp3.name}:\n{e.stderr.decode()}", file=sys.stderr)
+                if tmp.exists():
+                    tmp.unlink()
 
-            artist = artist_dir.name
-            album  = album_dir.name
-            cover  = ensure_cover(album_dir, artist, album, verbosity=verbosity, dry_run=dry_run)
 
-            if not cover:
-                continue
+def metadata_update_only(source_dir, dest_dir, verbosity=0, dry_run=False):
+    """Update tags and cover art in existing destination MP3s from source FLACs.
 
-            dest_album = Path(dest_dir) / artist / album
-            if not dest_album.exists():
-                continue
+    Audio is not re-encoded.  Only destination files that already exist are
+    processed — there is no conversion of new files.  The source directory is
+    never modified.
+    """
+    if dry_run:
+        print("[DRY RUN] No files will be modified.")
 
-            for mp3 in sorted(dest_album.glob("*.mp3")):
-                if dry_run:
-                    print(f"[UPDATE]  Cover art: {mp3.name}")
-                    continue
-                log(f"[UPDATE]  Cover art: {mp3.name}", verbosity)
-                tmp = mp3.with_suffix(".tmp.mp3")
-                try:
-                    subprocess.run(
-                        [
-                            "ffmpeg",
-                            "-i", str(mp3),
-                            "-i", str(cover),
-                            "-map", "0:a",               # audio from existing MP3
-                            "-map", "1:v",               # image from Folder.jpg/png
-                            "-codec:a", "copy",          # copy audio — no re-encode
-                            "-map_metadata", "0",        # preserve existing tags
-                            "-metadata:s:v", "title=Album cover",
-                            "-metadata:s:v", "comment=Cover (front)",
-                            "-id3v2_version", "3",
-                            "-y", str(tmp),
-                        ],
-                        check=True,
-                        capture_output=True,
-                    )
-                    tmp.replace(mp3)
-                except subprocess.CalledProcessError as e:
-                    print(f"[ERROR]   Failed to update cover art for {mp3.name}:\n{e.stderr.decode()}", file=sys.stderr)
-                    if tmp.exists():
-                        tmp.unlink()
+    for artist, album, flac_path in find_flac_files(source_dir):
+        dest_path = build_dest_path(dest_dir, artist, album, flac_path)
+
+        if not dest_path.exists():
+            log(f"[SKIP]    {flac_path.name} — no destination file", verbosity, level=2)
+            continue
+
+        # Use existing cover art from the source album dir — do not fetch
+        cover = next(
+            (flac_path.parent / name
+             for name in ("Folder.jpg", "folder.jpg", "Folder.png", "folder.png")
+             if (flac_path.parent / name).exists()),
+            None,
+        )
+
+        if dry_run:
+            suffix = " (with cover art)" if cover else ""
+            print(f"[UPDATE]  Metadata: {dest_path.name}{suffix}")
+            continue
+
+        log(f"[UPDATE]  Metadata: {dest_path.name}", verbosity)
+
+        tmp = dest_path.with_suffix(".tmp.mp3")
+        try:
+            cmd = [
+                "ffmpeg",
+                "-i", str(dest_path),    # input 0 — existing MP3 (audio)
+                "-i", str(flac_path),    # input 1 — source FLAC (metadata)
+            ]
+            if cover:
+                cmd += ["-i", str(cover)]  # input 2 — cover image
+
+            cmd += [
+                "-map", "0:a",             # audio stream from existing MP3
+                "-map_metadata", "1",      # all tags from source FLAC
+            ]
+            if cover:
+                cmd += [
+                    "-map", "2:v",
+                    "-metadata:s:v", "title=Album cover",
+                    "-metadata:s:v", "comment=Cover (front)",
+                ]
+            cmd += [
+                "-codec:a", "copy",        # copy audio — no re-encode
+                "-id3v2_version", "3",
+                "-y", str(tmp),
+            ]
+            subprocess.run(cmd, check=True, capture_output=True)
+            tmp.replace(dest_path)
+            log(f"[DONE]    {dest_path.name}{' (with cover art)' if cover else ''}", verbosity)
+        except subprocess.CalledProcessError as e:
+            print(f"[ERROR]   Failed to update metadata for {dest_path.name}:\n{e.stderr.decode()}", file=sys.stderr)
+            if tmp.exists():
+                tmp.unlink()
 
 
 def convert(source_dir, dest_dir, verbosity=0, dry_run=False):
@@ -414,7 +424,13 @@ def convert(source_dir, dest_dir, verbosity=0, dry_run=False):
             log(f"[SKIP]    {flac_path.name} — destination already exists", verbosity, level=2)
             continue
 
-        cover = ensure_cover(flac_path.parent, artist, album, verbosity=verbosity, dry_run=dry_run)
+        # Only use artwork already present in the source — do not write to source
+        cover = next(
+            (flac_path.parent / name
+             for name in ("Folder.jpg", "folder.jpg", "Folder.png", "folder.png")
+             if (flac_path.parent / name).exists()),
+            None,
+        )
 
         if dry_run:
             print(f"[CONVERT] {flac_path} -> {dest_path}")
@@ -458,31 +474,12 @@ def convert(source_dir, dest_dir, verbosity=0, dry_run=False):
             sys.exit(1)
 
 
-def cover_art_fetch_only(source_dir, verbosity=0, dry_run=False):
-    """Fetch missing cover art into source album directories only.
-
-    Does not convert any audio or embed images in MP3 files.
-    """
-    if dry_run:
-        print("[DRY RUN] No cover art will be fetched.")
-
-    for artist_dir in sorted(Path(source_dir).iterdir()):
-        if not artist_dir.is_dir():
-            continue
-        for album_dir in sorted(artist_dir.iterdir()):
-            if not album_dir.is_dir():
-                continue
-            artist = artist_dir.name
-            album  = album_dir.name
-            ensure_cover(album_dir, artist, album, verbosity=verbosity, dry_run=dry_run)
-
-
 def main():
     parser = argparse.ArgumentParser(
         prog="convert",
         description="Convert FLAC files to MP3, preserving artist/album directory structure.",
     )
-    parser.add_argument("-s", required=True, metavar="SOURCE", help="Source directory (artist/album/song structure)")
+    parser.add_argument("-s", required=True, metavar="SOURCE", help="Source directory — auto-detected as top-level (artist/album/song), artist-level (album/song), or album-level (song) structure")
     parser.add_argument("-d", required=True, metavar="DEST", help="Destination directory")
     parser.add_argument("-v", dest="verbosity", action="count", default=0,
                         help="Verbose output (-v: progress messages; -vv: also show skipped files)")
@@ -491,27 +488,26 @@ def main():
     parser.add_argument("--very_verbose", dest="verbosity", action="store_const", const=2,
                         help="Very verbose — all messages including skipped files")
     parser.add_argument("-n", action="store_true", dest="dry_run", help="Dry run — show what would be done without taking action")
-    parser.add_argument("--name_cleanup", action="store_true", help="Remove '(Explicit)' from album directory and song file names in both source and destination")
-    parser.add_argument("--cover_art_update", action="store_true", help="Re-embed cover art into existing destination MP3s without re-encoding audio")
-    parser.add_argument("--cover_art_fetch_only", action="store_true", help="Fetch missing cover art into source directories only — no conversion or MP3 embedding")
+    parser.add_argument("-m", "--metadata_update_only", action="store_true", help="Update tags and cover art in existing destination MP3s from source FLACs — no conversion or re-encoding")
+    parser.add_argument("--artwork_update_only", action="store_true", help="Re-embed cover art into existing destination MP3s without re-encoding audio — no conversion runs")
 
     args = parser.parse_args()
 
     if not os.path.isdir(args.s):
         parser.error(f"Source directory does not exist: {args.s}")
 
-    if args.cover_art_fetch_only:
-        cover_art_fetch_only(args.s, verbosity=args.verbosity, dry_run=args.dry_run)
+    if args.metadata_update_only:
+        metadata_update_only(args.s, args.d, verbosity=args.verbosity, dry_run=args.dry_run)
+        return
+
+    if args.artwork_update_only:
+        artwork_update_only(args.s, args.d, verbosity=args.verbosity, dry_run=args.dry_run)
         return
 
     if args.dry_run:
         print("[DRY RUN] No files will be converted.")
 
     convert(args.s, args.d, verbosity=args.verbosity, dry_run=args.dry_run)
-    if args.name_cleanup:
-        clean_explicit_names(args.s, args.d, verbosity=args.verbosity, dry_run=args.dry_run)
-    if args.cover_art_update:
-        cover_art_update(args.s, args.d, verbosity=args.verbosity, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
