@@ -24,6 +24,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import warnings
 from pathlib import Path
 
@@ -174,8 +175,68 @@ def artwork_fetch_only(source_dir, verbosity=0, dry_run=False):
 # Track-name helpers
 # ---------------------------------------------------------------------------
 
-_WIKI_API   = "https://en.wikipedia.org/w/api.php"
-_WIKI_HDRS  = {"User-Agent": "flac-to-mp3-converter/1.0 (music library tool)"}
+_WIKI_API        = "https://en.wikipedia.org/w/api.php"
+_WIKI_HDRS       = {"User-Agent": "flac-to-mp3-converter/1.0 (music library tool)"}
+_WIKI_CACHE_PATH = Path.home() / ".cache" / "flac-to-mp3" / "wiki_tracklists.json"
+_WIKI_MIN_GAP    = 0.5   # minimum seconds between Wikipedia API calls
+
+_wiki_last_call: float = 0.0   # monotonic timestamp of most-recent request
+
+
+def _wiki_get(url, **kwargs):
+    """Rate-limited wrapper around requests.get.
+
+    Ensures at least *_WIKI_MIN_GAP* seconds pass between successive calls so
+    we stay well within Wikipedia's API rate limits.
+    """
+    global _wiki_last_call
+    wait = _WIKI_MIN_GAP - (time.monotonic() - _wiki_last_call)
+    if wait > 0:
+        time.sleep(wait)
+    resp = requests.get(url, **kwargs)
+    _wiki_last_call = time.monotonic()
+    return resp
+
+
+def _cache_load():
+    """Load the on-disk Wikipedia track-listing cache.  Returns {} on any error."""
+    try:
+        if _WIKI_CACHE_PATH.exists():
+            with open(_WIKI_CACHE_PATH, encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _cache_save(cache):
+    """Persist the Wikipedia track-listing cache to disk.  Errors are non-fatal."""
+    try:
+        _WIKI_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_WIKI_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _versions_to_json(versions):
+    """Serialise ``[(disc, track): title]`` dicts to JSON-safe ``"disc:track"`` keys."""
+    return [
+        {f"{d}:{t}": title for (d, t), title in v.items()}
+        for v in versions
+    ]
+
+
+def _versions_from_json(data):
+    """Deserialise JSON ``"disc:track"`` keys back to ``(int, int)`` tuple keys."""
+    result = []
+    for v in data:
+        tracks = {}
+        for k, title in v.items():
+            d, t = k.split(":")
+            tracks[(int(d), int(t))] = title
+        result.append(tracks)
+    return result
 
 
 def _find_track_listing_blocks(content):
@@ -356,18 +417,34 @@ def _best_matching_version(versions, local_tracks):
 def fetch_wikipedia_tracklist(artist, album, verbosity=0):
     """Search Wikipedia for *artist – album* and return all track-listing versions.
 
+    Results are cached in ``~/.cache/flac-to-mp3/wiki_tracklists.json`` so that
+    repeated runs never re-fetch an album that has already been looked up.
+    Requests are rate-limited to at most one every *_WIKI_MIN_GAP* seconds.
+
     Returns a list of ``{(disc, track): title}`` dicts — one per edition found on
     the Wikipedia page (original, reissue, deluxe, etc.).  Returns an empty list
     if the album page or any track listing could not be found.
     """
+    cache_key = f"{artist}||{album}"
+    cache     = _cache_load()
+
+    # --- Cache hit ---
+    if cache_key in cache:
+        stored = cache[cache_key]
+        if stored is None:
+            log(f"[WIKI]    Cache: no listing for '{artist} — {album}'", verbosity)
+            return []
+        log(f"[WIKI]    Cache hit for '{artist} — {album}'", verbosity)
+        return _versions_from_json(stored)
+
+    # --- Cache miss: fetch from Wikipedia ---
     try:
-        # Build an ordered list of candidate page titles.
         # The disambiguated form "{album} ({artist} album)" is tried first
         # because a plain search often returns the song page instead of the
         # album page (e.g. "Let's Stay Together" song vs. album).
         candidates = [f"{album} ({artist} album)"]
 
-        search_resp = requests.get(_WIKI_API, headers=_WIKI_HDRS, params={
+        search_resp = _wiki_get(_WIKI_API, headers=_WIKI_HDRS, params={
             "action": "query", "list": "search",
             "srsearch": f"{artist} {album} album",
             "format": "json", "srlimit": 5,
@@ -381,7 +458,7 @@ def fetch_wikipedia_tracklist(artist, album, verbosity=0):
             log(f"[WIKI]    Trying page: '{page_title}'", verbosity)
 
             # Fetch wikitext (formatversion=2 gives pages as a list)
-            rev = requests.get(_WIKI_API, headers=_WIKI_HDRS, params={
+            rev = _wiki_get(_WIKI_API, headers=_WIKI_HDRS, params={
                 "action": "query", "titles": page_title,
                 "prop": "revisions", "rvprop": "content",
                 "rvslots": "main", "format": "json", "formatversion": "2",
@@ -401,8 +478,13 @@ def fetch_wikipedia_tracklist(artist, album, verbosity=0):
             if versions:
                 log(f"[WIKI]    Found {len(versions)} version(s) on '{page_title}'",
                     verbosity)
+                cache[cache_key] = _versions_to_json(versions)
+                _cache_save(cache)
                 return versions
 
+        # Cache the miss so we don't hammer Wikipedia again on the next run
+        cache[cache_key] = None
+        _cache_save(cache)
         return []
 
     except requests.RequestException as e:
